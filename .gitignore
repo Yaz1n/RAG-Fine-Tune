@@ -1,0 +1,13 @@
+.env
+vectorstore/
+training_data/
+student_flan_t5_small/
+evaluation_result/
+data/
+__pycache__/
+student_flan_t5_small_groq/
+ai.txt
+ml.txt
+ml.pdf
+sample.pdf
+nlp.txt
