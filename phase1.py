@@ -446,7 +446,7 @@ def main():
     
     print("=== Phase 1: Data Preparation and Infrastructure Setup ===\n")
     # Initialize document processor
-    processor = DocumentProcessor(chunk_size=256, chunk_overlap=50)
+    processor = DocumentProcessor(chunk_size=512, chunk_overlap=50)
     
     # Process documents
     print("1. Processing documents...")

@@ -173,7 +173,6 @@ class QueryGenerator:
             concepts = [c.strip().lower() for c in cleaned_response.split(',') if c.strip()]
             # Filter concepts based on stopwords and length
             concepts = [c for c in concepts if c not in STOPWORDS and len(c.split()) <= 4 and len(c) > 2]
-            
             return concepts[:3] # Return top 3 concepts
         except Exception as e:
             logger.error(f"Error extracting concepts: {e}")
@@ -682,7 +681,7 @@ async def main(): # This is already async, which is good
     # Await the async method call
     training_examples = await dataset_builder.build_training_dataset( 
         document_chunks,
-        queries_per_chunk=3,
+        queries_per_chunk=4,
         cross_chunk_queries_count=5, # You can adjust this
         min_confidence=0.4
     )

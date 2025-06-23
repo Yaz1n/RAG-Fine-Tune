@@ -179,14 +179,14 @@ def save_rag_pipeline_config(model_name: str, tokenizer, output_dir: str):
             "rerank": True
         },
         "generation": {
-            "max_new_tokens": 128,
+            "max_new_tokens": 1000,
             "temperature": 0.1,
             "top_p": 0.9,
             "repetition_penalty": 1.1,
             "do_sample": True
         },
         "prompt_template": {
-            "system": "You are a helpful assistant that answers questions based on the provided context.",
+            "system": "You are a helpful assistant that answers questions based on the provided context. Analyze the provided context and generate answer to the question from the context",
             "context_template": "Context:\n{context}\n\nQuestion: {question}\n\nAnswer:",
             "max_context_length": tokenizer.model_max_length - 100
         }

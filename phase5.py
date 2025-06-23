@@ -54,7 +54,7 @@ def main():
     parser.add_argument("--train-data", type=str, required=True, help="Path to training dataset (jsonl)")
     parser.add_argument("--eval-data", type=str, required=True, help="Path to evaluation dataset (jsonl)")
     parser.add_argument("--output-dir", type=str, default="./student_flan_t5_small", help="Directory for checkpoints, logs, configs")
-    parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--max-length", type=int, default=512)
