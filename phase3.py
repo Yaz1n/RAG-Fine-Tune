@@ -682,7 +682,7 @@ async def main(): # This is already async, which is good
     # Await the async method call
     training_examples = await dataset_builder.build_training_dataset( 
         document_chunks,
-        queries_per_chunk=4,
+        queries_per_chunk=3,
         cross_chunk_queries_count=5, # You can adjust this
         min_confidence=0.4
     )
