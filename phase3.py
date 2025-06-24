@@ -317,7 +317,7 @@ class QueryGenerator:
 
 class TeacherResponseCollector:
     """Collect high-quality responses from the teacher model"""
-    def __init__(self, teacher_model: BaseTeacherModel, vector_store: VectorStore, retrieval_k=1):
+    def __init__(self, teacher_model: BaseTeacherModel, vector_store: VectorStore, retrieval_k=3):
         self.teacher_model = teacher_model
         self.vector_store = vector_store
         self.retrieval_k = retrieval_k
@@ -694,7 +694,7 @@ async def main(): # This is already async, which is good
     training_examples = await dataset_builder.build_training_dataset( 
         document_chunks,
         queries_per_chunk=4,
-        cross_chunk_queries_count=5, # You can adjust this
+        cross_chunk_queries_count=20, # You can adjust this
         min_confidence=0.4
     )
 

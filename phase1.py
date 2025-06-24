@@ -1,13 +1,9 @@
-# Phase 1: Data Preparation and Infrastructure Setup
-# Complete implementation for document processing and vector store setup
-
 import os
 import json
 import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-import logging
 
 # Core libraries
 import numpy as np
@@ -35,9 +31,7 @@ from chromadb.config import Settings
 nltk.download('punkt', quiet=True)
 nltk.download('stopwords', quiet=True)
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+UPLOAD_DIR = "uploaded_files"
 
 @dataclass
 class DocumentChunk:
@@ -69,7 +63,7 @@ class DocumentProcessor:
                     text += page.extract_text() + "\n"
                 return text
         except Exception as e:
-            logger.error(f"Error reading PDF {file_path}: {e}")
+            print(f"Error reading PDF {file_path}: {e}")
             return ""
     
     def load_docx(self, file_path: str) -> str:
@@ -81,7 +75,7 @@ class DocumentProcessor:
                 text += paragraph.text + "\n"
             return text
         except Exception as e:
-            logger.error(f"Error reading DOCX {file_path}: {e}")
+            print(f"Error reading DOCX {file_path}: {e}")
             return ""
     
     def load_txt(self, file_path: str) -> str:
@@ -90,7 +84,7 @@ class DocumentProcessor:
             with open(file_path, 'r', encoding='utf-8') as file:
                 return file.read()
         except Exception as e:
-            logger.error(f"Error reading TXT {file_path}: {e}")
+            print(f"Error reading TXT {file_path}: {e}")
             return ""
     
     def load_web_page(self, url: str) -> str:
@@ -112,7 +106,7 @@ class DocumentProcessor:
             
             return text
         except Exception as e:
-            logger.error(f"Error loading web page {url}: {e}")
+            print(f"Error loading web page {url}: {e}")
             return ""
     
     def load_document(self, source: str) -> str:
@@ -126,7 +120,7 @@ class DocumentProcessor:
         elif source.endswith('.txt'):
             return self.load_txt(source)
         else:
-            logger.warning(f"Unsupported file type: {source}")
+            print(f"Unsupported file type: {source}")
             return ""
     
     def clean_text(self, text: str) -> str:
@@ -288,7 +282,7 @@ class DocumentProcessor:
         all_chunks = []
         
         for source in tqdm(sources, desc="Processing documents"):
-            logger.info(f"Processing: {source}")
+            print(f" Processing: {source}")
             
             # Load document
             text = self.load_document(source)
@@ -308,7 +302,7 @@ class DocumentProcessor:
             chunks = self.filter_chunks(chunks)
             
             all_chunks.extend(chunks)
-            logger.info(f"Created {len(chunks)} chunks from {source}")
+            print(f"Created {len(chunks)} chunks from {source}")
         
         return all_chunks
 
@@ -331,7 +325,7 @@ class VectorStore:
             metadata={"hnsw:space": "cosine"}
         )
         
-        logger.info(f"Initialized vector store with collection: {collection_name}")
+        print(f"Initialized vector store with collection: {collection_name}")
     
     def add_chunks(self, chunks: List[DocumentChunk]) -> None:
         """Add document chunks to vector store"""
@@ -339,7 +333,7 @@ class VectorStore:
             return
         
         # Generate embeddings
-        logger.info("Generating embeddings...")
+        print("Generating embeddings...")
         texts = [chunk.content for chunk in chunks]
         embeddings = self.embedding_model.encode(texts, show_progress_bar=True)
         
@@ -360,7 +354,7 @@ class VectorStore:
         
         # Add to collection in batches
         batch_size = 100
-        for i in tqdm(range(0, len(chunks), batch_size), desc="Adding to vector store"):
+        for i in tqdm(range(0, len(chunks), batch_size)):
             batch_end = min(i + batch_size, len(chunks))
             
             self.collection.add(
@@ -370,7 +364,7 @@ class VectorStore:
                 metadatas=metadatas[i:batch_end]
             )
         
-        logger.info(f"Added {len(chunks)} chunks to vector store")
+        print(f"Added {len(chunks)} chunks to vector store")
     
     def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         """Search for similar chunks"""
@@ -439,42 +433,38 @@ class VectorStore:
 def main():
     """Main function to demonstrate Phase 1 implementation"""
     
-    # Sample document sources (replace with your actual sources)
-    sample_sources = [
-     "sample.pdf"
-    ]
+    sources = []
+    for f in os.listdir(UPLOAD_DIR):
+        file_path = os.path.join(UPLOAD_DIR, f)
+        if os.path.isfile(file_path):
+            sources.append(file_path)
+    if not sources:
+        print(f"No files found in {UPLOAD_DIR}. Please upload documents first.")
+        return
     
-    print("=== Phase 1: Data Preparation and Infrastructure Setup ===\n")
+    print("Phase 1: Data Preparation and Infrastructure Setup\n")
     # Initialize document processor
     processor = DocumentProcessor(chunk_size=512, chunk_overlap=50)
     
     # Process documents
-    print("1. Processing documents...")
-    chunks = processor.process_documents(sample_sources, chunk_method='semantic')
-    print(f"Created {len(chunks)} chunks total\n")
+    print("1.Processing documents...")
+    chunks = processor.process_documents(sources, chunk_method='semantic')
     
     # Initialize vector store
-    print("2. Setting up vector store...")
+    print("2.Setting up vector store...")
     vector_store = VectorStore(collection_name="rag_demo", persist_directory="./data/chroma_db")
     
     # Add chunks to vector store
-    print("3. Adding chunks to vector store...")
+    print("3.Adding chunks to vector store...")
     vector_store.add_chunks(chunks)
     
     # Get collection statistics
-    print("4. Collection statistics:")
+    print("4.Collection statistics:")
     stats = vector_store.get_collection_stats()
     for key, value in stats.items():
         print(f"   {key}: {value}")
     
-    print("\n=== Phase 1 Complete ===")
-    print("✓ Document processing pipeline implemented")
-    print("✓ Vector store setup and populated")
-    print("✓ Search functionality working")
-    print("✓ Ready for Phase 2: Teacher Model Setup")
-
     #for debugging purpose only
-    print("\n=== Interactive Search Demo ===")
     print("Enter a query to find similar content. Type 'exit' to quit.")
     
     while True:
@@ -500,19 +490,7 @@ def main():
         else:
             print("No relevant chunks found or an error occurred during search.")
     
-    print("\nSearch demo ended. Exiting.")
+    print("\nSearch ended. Exiting....")
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-   
-    
-
-    

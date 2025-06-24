@@ -6,12 +6,6 @@ import os
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-# Verify API key is loaded
-api_key = os.getenv("GROQ_API_KEY")
-if not api_key:
-    print("WARNING: GROQ_API_KEY not loaded in phase2.py")
-else:
-    print(f"✅ API key loaded in phase2.py: {api_key[:10]}...{api_key[-4:]}")
 import os
 import json
 import time
@@ -343,7 +337,7 @@ def main():
         # or pass it directly here: groq_api_key="your_groq_api_key"
         teacher_model = TeacherModelFactory.create_model(
             'groq',
-            model_name='llama3-8b-8192', # Or any other Groq model, e.g., 'mixtral-8x7b-32768'
+            model_name='llama3-70b-8192', # Or any other Groq model, e.g., 'mixtral-8x7b-32768'
             groq_api_key=os.getenv("GROQ_API_KEY") 
         )
         print("   ✓ Groq Llama3 model initialized")
