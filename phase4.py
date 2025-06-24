@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StudentModelConfig:
-    """Configuration for student model setup"""
+    """Configuration dataclass that stores all the settings for the student model setup."""
     base_model: str
     model_name: str
     max_seq_length: int
@@ -23,161 +23,49 @@ class StudentModelConfig:
     torch_dtype: str
     custom_components: Dict[str, Any]
 
-class RetrievalAwareStudentModel(nn.Module):
+def get_normal_student_config() -> StudentModelConfig:
     """
-    Retrieval-aware wrapper for sequence-to-sequence models (like T5).
-    Fuses external retrieval context embeddings with encoder hidden states.
-    """
-    def __init__(self, base_model, retrieval_dim: int = 384, fusion_method: str = "concat"):
-        super().__init__()
-        self.base_model = base_model
-        self.retrieval_dim = retrieval_dim
-        self.fusion_method = fusion_method
-
-        self.hidden_size = base_model.config.d_model
-
-        # Retrieval integration components
-        if fusion_method == "concat":
-            self.retrieval_projection = nn.Linear(retrieval_dim, self.hidden_size)
-            self.fusion_gate = nn.Sequential(
-                nn.Linear(self.hidden_size * 2, self.hidden_size),
-                nn.Sigmoid()
-            )
-        elif fusion_method == "attention":
-            self.retrieval_projection = nn.Linear(retrieval_dim, self.hidden_size)
-            self.retrieval_attention = nn.MultiheadAttention(
-                embed_dim=self.hidden_size,
-                num_heads=8,
-                batch_first=True
-            )
-        # Additional methods can be added as needed
-
-    def encode_retrieval_context(self, retrieval_embeddings):
-        """Encode retrieval context (project to model hidden size)"""
-        if retrieval_embeddings is None:
-            return None
-        projected = self.retrieval_projection(retrieval_embeddings)
-        return projected
-
-    def fuse_retrieval_info(self, encoder_hidden_states, retrieval_context):
-        if retrieval_context is None:
-            return encoder_hidden_states
-
-        if self.fusion_method == "concat":
-            batch_size, seq_len, hidden_dim = encoder_hidden_states.shape
-            pooled_context = retrieval_context.mean(dim=1, keepdim=True)
-            pooled_context = pooled_context.expand(-1, seq_len, -1)
-            combined = torch.cat([encoder_hidden_states, pooled_context], dim=-1)
-            gate = self.fusion_gate(combined)
-            fused = encoder_hidden_states * gate + pooled_context * (1 - gate)
-            return fused
-
-        elif self.fusion_method == "attention":
-            attended_context, _ = self.retrieval_attention(
-                encoder_hidden_states, retrieval_context, retrieval_context
-            )
-            fused = encoder_hidden_states + attended_context
-            return fused
-
-        else:
-            return encoder_hidden_states
-
-    def forward(
-        self,
-        input_ids,
-        attention_mask=None,
-        decoder_input_ids=None,
-        decoder_attention_mask=None,
-        retrieval_embeddings=None,
-        **kwargs
-    ):
-        # Encode inputs
-        encoder_outputs = self.base_model.encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True,
-        )
-        encoder_hidden_states = encoder_outputs.last_hidden_state
-
-        # Encode retrieval and fuse
-        retrieval_context = self.encode_retrieval_context(retrieval_embeddings)
-        fused_encoder_hidden = self.fuse_retrieval_info(
-            encoder_hidden_states, retrieval_context
-        )
-
-        # Pass through decoder
-        outputs = self.base_model(
-            inputs_embeds=fused_encoder_hidden,
-            attention_mask=attention_mask,
-            decoder_input_ids=decoder_input_ids,
-            decoder_attention_mask=decoder_attention_mask,
-            **kwargs
-        )
-
-        return outputs
-
-def get_student_config() -> StudentModelConfig:
-    """
-    Returns the configuration for flan-t5-small as retrieval-aware student.
+    Returns the configuration for flan-t5-small as a normal student (no retrieval).
     """
     return StudentModelConfig(
         base_model="google/flan-t5-small",
-        model_name="student_flan-t5-small_retrievalaware",
+        model_name="student_flan-t5-small_normal",
         max_seq_length=512,
         device_map="auto",
         torch_dtype="float32",
         custom_components={
-            "retrieval_aware": True,
-            "fusion_method": "concat",
-            "retrieval_dim": 384
+            "retrieval_aware": False,  # Set to False for normal model
         }
     )
 
-def load_student_model(config: StudentModelConfig) -> Tuple[nn.Module, Any]:
+def load_normal_student_model(config: StudentModelConfig) -> Tuple[nn.Module, Any]:
     """
-    Loads flan-t5-small as retrieval-aware student.
+    Loads flan-t5-small as a normal student model (without retrieval awareness).
     """
-    logger.info(f"Loading student model: {config.model_name}")
+    logger.info(f"Loading normal student model: {config.model_name}")
+    
     tokenizer = AutoTokenizer.from_pretrained(
         config.base_model,
         trust_remote_code=True
     )
-    base_model = AutoModelForSeq2SeqLM.from_pretrained(
+    
+    # Load the base model directly without any wrapper
+    model = AutoModelForSeq2SeqLM.from_pretrained(
         config.base_model,
         torch_dtype=getattr(torch, config.torch_dtype),
         device_map=config.device_map,
         trust_remote_code=True
     )
-    # Retrieval-aware wrapper
-    if config.custom_components.get("retrieval_aware", False):
-        model = RetrievalAwareStudentModel(
-            base_model=base_model,
-            retrieval_dim=config.custom_components.get("retrieval_dim", 384),
-            fusion_method=config.custom_components.get("fusion_method", "concat")
-        )
-        logger.info("Loaded retrieval-aware flan-t5-small model.")
-    else:
-        model = base_model
+    
     tokenizer.model_max_length = config.max_seq_length
+    logger.info("Loaded normal flan-t5-small model.")
+    
     return model, tokenizer
 
-def save_student_config(config: StudentModelConfig, output_dir: str):
-    Path(output_dir).mkdir(exist_ok=True)
-    config_path = Path(output_dir) / f"{config.model_name}_config.json"
-    with open(config_path, "w") as f:
-        json.dump(asdict(config), f, indent=2)
-    logger.info(f"Saved student config to {config_path}")
-
-def save_rag_pipeline_config(model_name: str, tokenizer, output_dir: str):
-    rag_cfg = {
+def save_normal_pipeline_config(model_name: str, tokenizer, output_dir: str):
+    """Save configuration for normal (non-RAG) pipeline"""
+    normal_cfg = {
         "model_name": model_name,
-        "retrieval": {
-            "embedding_model": "all-MiniLM-L6-v2",
-            "chunk_size": 512,
-            "chunk_overlap": 50,
-            "retrieval_k": 5,
-            "rerank": True
-        },
         "generation": {
             "max_new_tokens": 1000,
             "temperature": 0.1,
@@ -186,30 +74,40 @@ def save_rag_pipeline_config(model_name: str, tokenizer, output_dir: str):
             "do_sample": True
         },
         "prompt_template": {
-            "system": "You are a helpful assistant that answers questions based on the provided context. Analyze the provided context and generate answer to the question from the context",
-            "context_template": "Context:\n{context}\n\nQuestion: {question}\n\nAnswer:",
-            "max_context_length": tokenizer.model_max_length - 100
+            "system": "You are a helpful assistant that answers questions accurately and concisely.",
+            "input_template": "Question: {question}\n\nAnswer:",
+            "max_input_length": tokenizer.model_max_length - 100
         }
     }
-    cfg_path = Path(output_dir) / f"{model_name}_rag_pipeline_config.yaml"
+    
+    cfg_path = Path(output_dir) / f"{model_name}_pipeline_config.yaml"
     with open(cfg_path, "w") as f:
-        yaml.dump(rag_cfg, f)
-    logger.info(f"Saved RAG pipeline config to {cfg_path}")
+        yaml.dump(normal_cfg, f)
+    logger.info(f"Saved normal pipeline config to {cfg_path}")
 
 def main():
-    # ---- PHASE 1 & 2 & 3 INTEGRATION ----
-    # Assume you have run Phase 1 (vector store), Phase 2 (teacher model), Phase 3 (training data)
-    # Use the output_dir to save configs for downstream training and evaluation
-
-    output_dir = "./student_flan_t5_small"
-    config = get_student_config()
-    save_student_config(config, output_dir)
-    model, tokenizer = load_student_model(config)
-    save_rag_pipeline_config(config.model_name, tokenizer, output_dir)
-
-    print(f"\nStudent model flan-t5-small (retrieval-aware) is ready for training!")
+    """Main function to set up normal student model"""
+    output_dir = "./student_flan_t5_small_normal"
+    
+    # Get normal student config (no retrieval)
+    config = get_normal_student_config()
+    
+    # Save config
+    Path(output_dir).mkdir(exist_ok=True)
+    config_path = Path(output_dir) / f"{config.model_name}_config.json"
+    with open(config_path, "w") as f:
+        json.dump(asdict(config), f, indent=2)
+    logger.info(f"Saved student config to {config_path}")
+    
+    # Load model and tokenizer
+    model, tokenizer = load_normal_student_model(config)
+    
+    # Save pipeline config
+    save_normal_pipeline_config(config.model_name, tokenizer, output_dir)
+    
+    print(f"\nNormal student model flan-t5-small is ready!")
     print(f"Configs and artifacts saved in {output_dir}/")
-    print("You can now use this model in your training pipeline with the data from Phase 3.")
+    print("This model works independently without requiring external retrieval.")
 
 if __name__ == "__main__":
     main()

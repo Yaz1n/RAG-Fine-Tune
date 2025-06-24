@@ -1,5 +1,17 @@
 from dotenv import load_dotenv
-load_dotenv()
+from pathlib import Path
+import os
+
+# Load .env from the same directory as this script
+env_path = Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path)
+
+# Verify API key is loaded
+api_key = os.getenv("GROQ_API_KEY")
+if not api_key:
+    print("WARNING: GROQ_API_KEY not loaded in phase2.py")
+else:
+    print(f"✅ API key loaded in phase2.py: {api_key[:10]}...{api_key[-4:]}")
 import os
 import json
 import random

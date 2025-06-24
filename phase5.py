@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Phase 5: Distillation Training Pipeline for Retrieval-Aware Flan-T5-Small
-Aligns with Phases 1-4; focuses on training a single retrieval-aware student model.
+Phase 5: Distillation Training Pipeline for Flan-T5-Small
+Supports both normal and retrieval-aware student models.
+Aligns with Phases 1-4; focuses on training a single student model.
 """
 
 import os
@@ -25,10 +26,10 @@ from datetime import datetime
 
 # === Phase 4: Student Model Config ===
 from phase4 import (
-    get_student_config,
-    load_student_model,
-    save_student_config,
-    save_rag_pipeline_config
+    # Import normal student functions
+    get_normal_student_config,
+    load_normal_student_model,
+    save_normal_pipeline_config
 )
 
 logging.basicConfig(
@@ -50,33 +51,40 @@ def create_output_dirs(output_dir):
     Path(f"{output_dir}/logs").mkdir(exist_ok=True)
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 5: Retrieval-Aware Flan-T5-Small Distillation Training")
+    parser = argparse.ArgumentParser(description="Phase 5: Flan-T5-Small Distillation Training")
     parser.add_argument("--train-data", type=str, required=True, help="Path to training dataset (jsonl)")
     parser.add_argument("--eval-data", type=str, required=True, help="Path to evaluation dataset (jsonl)")
     parser.add_argument("--output-dir", type=str, default="./student_flan_t5_small", help="Directory for checkpoints, logs, configs")
+    parser.add_argument("--model-type", type=str, default="normal")
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--max-length", type=int, default=512)
-    parser.add_argument("--retrieval-dim", type=int, default=384)
-    parser.add_argument("--fusion-method", type=str, default="concat", choices=["concat", "attention"])
+    parser.add_argument("--retrieval-dim", type=int, default=384, help="Only used for retrieval-aware model")
+    parser.add_argument("--fusion-method", type=str, default="concat", choices=["concat", "attention"], 
+                       help="Only used for retrieval-aware model")
     parser.add_argument("--fp16", action="store_true")
     args = parser.parse_args()
 
     # === Output Dir Setup ===
     create_output_dirs(args.output_dir)
     logger.info(f"Output directory: {args.output_dir}")
+    logger.info(f"Model type: {args.model_type}")
 
     # === Phase 4: Student Model Config and Load ===
-    config = get_student_config()
+      # normal
+    config = get_normal_student_config()
     config.max_seq_length = args.max_length
-    config.custom_components["fusion_method"] = args.fusion_method
-    config.custom_components["retrieval_dim"] = args.retrieval_dim
-    save_student_config(config, args.output_dir)
-    model, tokenizer = load_student_model(config)
-    save_rag_pipeline_config(config.model_name, tokenizer, args.output_dir)
-
-    logger.info("Loaded retrieval-aware flan-t5-small student model and configs.")
+        # Save config
+    config_path = Path(args.output_dir) / f"{config.model_name}_config.json"
+    with open(config_path, "w") as f:
+            from dataclasses import asdict
+            json.dump(asdict(config), f, indent=2)
+    logger.info(f"Saved student config to {config_path}")
+        
+    model, tokenizer = load_normal_student_model(config)
+    save_normal_pipeline_config(config.model_name, tokenizer, args.output_dir)
+    logger.info("Loaded normal flan-t5-small student model and configs.")
 
     # === Load Training and Eval Data ===
     train_data = load_jsonl(args.train_data)
@@ -86,20 +94,22 @@ def main():
     # === Build PyTorch Dataset and DataLoader ===
     from torch.utils.data import Dataset, DataLoader
 
-    class RAGDistillationDataset(Dataset):
+    class DistillationDataset(Dataset):
         """
+        Supports both normal and retrieval-aware training.
         Expects each example as:
             {
                 "query": str,
-                "context": str,
+                "context": str (optional for normal model),
                 "teacher_response": str,
-                "retrieval_embedding": [float, ...] (optional)
+                "retrieval_embedding": [float, ...] (optional, only used for retrieval-aware)
             }
         """
-        def __init__(self, data, tokenizer, max_length, retrieval_dim):
+        def __init__(self, data, tokenizer, max_length, model_type, retrieval_dim=384):
             self.data = data
             self.tokenizer = tokenizer
             self.max_length = max_length
+            self.model_type = model_type
             self.retrieval_dim = retrieval_dim
 
         def __len__(self):
@@ -107,7 +117,13 @@ def main():
 
         def __getitem__(self, idx):
             ex = self.data[idx]
-            input_text = f"Context: {ex['context']}\n\nQuestion: {ex['query']}\n\nAnswer:"
+            
+            # Format input based on model type
+            if self.model_type == "retrieval-aware":
+                input_text = f"Context: {ex.get('context', '')}\n\nQuestion: {ex['query']}\n\nAnswer:"
+            else:  # normal
+                input_text = f"Question: {ex['query']}\n\nAnswer:"
+            
             target_text = ex['teacher_response']
 
             # Tokenize inputs and labels
@@ -126,23 +142,26 @@ def main():
                 return_tensors="pt"
             )["input_ids"]
 
-            # Optional: Load retrieval embedding if present
-            retrieval_embedding = ex.get("retrieval_embedding", None)
-            if retrieval_embedding is not None:
-                retrieval_embedding = torch.tensor(retrieval_embedding, dtype=torch.float).unsqueeze(0)
-                # Shape: (1, retrieval_dim)
-            else:
-                retrieval_embedding = torch.zeros((1, self.retrieval_dim), dtype=torch.float)
-
-            return {
+            result = {
                 "input_ids": tokenized["input_ids"].squeeze(0),
                 "attention_mask": tokenized["attention_mask"].squeeze(0),
-                "labels": labels.squeeze(0),
-                "retrieval_embeddings": retrieval_embedding
+                "labels": labels.squeeze(0)
             }
 
-    train_dataset = RAGDistillationDataset(train_data, tokenizer, args.max_length, args.retrieval_dim)
-    eval_dataset = RAGDistillationDataset(eval_data, tokenizer, args.max_length, args.retrieval_dim)
+            # Add retrieval embeddings only for retrieval-aware model
+            if self.model_type == "retrieval-aware":
+                retrieval_embedding = ex.get("retrieval_embedding", None)
+                if retrieval_embedding is not None:
+                    retrieval_embedding = torch.tensor(retrieval_embedding, dtype=torch.float).unsqueeze(0)
+                    # Shape: (1, retrieval_dim)
+                else:
+                    retrieval_embedding = torch.zeros((1, self.retrieval_dim), dtype=torch.float)
+                result["retrieval_embeddings"] = retrieval_embedding
+
+            return result
+
+    train_dataset = DistillationDataset(train_data, tokenizer, args.max_length, args.model_type, args.retrieval_dim)
+    eval_dataset = DistillationDataset(eval_data, tokenizer, args.max_length, args.model_type, args.retrieval_dim)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size)
 
@@ -163,25 +182,26 @@ def main():
             optimizer.zero_grad()
             batch = {k: v.to(device) for k, v in batch.items()}
 
+            # Prepare model inputs based on model type
+            model_inputs = {
+                "input_ids": batch["input_ids"],
+                "attention_mask": batch["attention_mask"],
+                "labels": batch["labels"]
+            }
+            
+            # Add retrieval embeddings only for retrieval-aware model
+            if args.model_type == "retrieval-aware":
+                model_inputs["retrieval_embeddings"] = batch["retrieval_embeddings"]
+
             if args.fp16:
                 with torch.cuda.amp.autocast():
-                    outputs = model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        labels=batch["labels"],
-                        retrieval_embeddings=batch["retrieval_embeddings"]
-                    )
+                    outputs = model(**model_inputs)
                     loss = outputs.loss
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                    retrieval_embeddings=batch["retrieval_embeddings"]
-                )
+                outputs = model(**model_inputs)
                 loss = outputs.loss
                 loss.backward()
                 optimizer.step()
@@ -199,13 +219,21 @@ def main():
         with torch.no_grad():
             for batch in eval_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                    retrieval_embeddings=batch["retrieval_embeddings"]
-                )
+                
+                # Prepare model inputs based on model type
+                model_inputs = {
+                    "input_ids": batch["input_ids"],
+                    "attention_mask": batch["attention_mask"],
+                    "labels": batch["labels"]
+                }
+                
+                # Add retrieval embeddings only for retrieval-aware model
+                if args.model_type == "retrieval-aware":
+                    model_inputs["retrieval_embeddings"] = batch["retrieval_embeddings"]
+                
+                outputs = model(**model_inputs)
                 eval_loss += outputs.loss.item()
+                
         avg_eval_loss = eval_loss / len(eval_loader)
         logger.info(f"Epoch {epoch+1} Eval Loss: {avg_eval_loss:.4f}")
 
@@ -218,6 +246,7 @@ def main():
 
     logger.info("Training complete.")
     logger.info(f"Best eval loss: {best_eval_loss:.4f}")
+    logger.info(f"Model type trained: {args.model_type}")
 
 if __name__ == "__main__":
     main()
