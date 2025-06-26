@@ -1,44 +1,29 @@
+import logging
 from dotenv import load_dotenv
 from pathlib import Path
-import os
-
-# Load .env from the same directory as this script
-env_path = Path(__file__).parent / '.env'
-load_dotenv(dotenv_path=env_path)
-
-# Verify API key is loaded
-api_key = os.getenv("GROQ_API_KEY")
-if not api_key:
-    print("WARNING: GROQ_API_KEY not loaded in phase2.py")
-else:
-    print(f"✅ API key loaded in phase2.py: {api_key[:10]}...{api_key[-4:]}")
 import os
 import json
 import random
 import asyncio
 import re
-from typing import List, Dict, Any, Tuple, Optional # Import Optional
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
-from pathlib import Path
-import logging
+import numpy as np
 from tqdm import tqdm
 import pandas as pd
 from sentence_transformers import SentenceTransformer
-import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import string
-
-# Import real VectorStore and the updated TeacherModelFactory from phase2
+from groq import APIStatusError
+from tenacity import retry, stop_after_attempt, wait_exponential
 from phase1 import VectorStore
-from phase2 import TeacherModelFactory, BaseTeacherModel # Import BaseTeacherModel for type hinting
+from phase2 import TeacherModelFactory, BaseTeacherModel
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 @dataclass
 class TrainingExample:
-    """Structure for a single training example"""
     query: str
     context: str
     teacher_response: str
@@ -49,38 +34,43 @@ class TrainingExample:
     metadata: Dict[str, Any]
 
 class QueryGenerator:
-    """Generate diverse queries from document chunks"""
-    
-    def __init__(self, teacher_model: BaseTeacherModel, embedding_model_name="all-MiniLM-L6-v2"):
+    def __init__(self, teacher_model: BaseTeacherModel, embedding_model_name="all-mpnet-base-v2"):
         self.teacher_model = teacher_model
         self.embedding_model = SentenceTransformer(embedding_model_name)
-        
-        # Query templates for different types and difficulty levels
         self.query_templates = {
             "factual": {
                 "simple": [
                     "What is {concept}?",
-                    "Define {concept}."
+                    "Define {concept}.",
+                    "What does {concept} mean?"
                 ],
                 "medium": [
                     "How does {concept} work?",
                     "What are the key features of {concept}?",
-                    "Why is {concept} important?"
+                    "Why is {concept} important?",
+                    "What is the purpose of {concept}?"
                 ],
                 "complex": [
-                    "What are the advantages and disadvantages of {concept}?"
+                    "What are the advantages and disadvantages of {concept}?",
+                    "How has {concept} evolved over time?",
+                    "What are the applications of {concept}?"
                 ]
             },
             "analytical": {
                 "simple": [
                     "List the main components of {concept}.",
-                    "What are the types of {concept}?"
+                    "What are the types of {concept}?",
+                    "Identify the key parts of {concept}."
                 ],
                 "medium": [
-                    "Name the key elements of {concept}."
+                    "Name the key elements of {concept}.",
+                    "How is {concept} implemented?",
+                    "What factors affect {concept}?"
                 ],
                 "complex": [
-                    "What factors influence the success of {concept}?"
+                    "What factors influence the success of {concept}?",
+                    "Analyze the impact of {concept} on its domain.",
+                    "Evaluate the effectiveness of {concept}."
                 ]
             },
             "summarization": {
@@ -95,24 +85,26 @@ class QueryGenerator:
                     "Provide a comprehensive summary of {concept}."
                 ],
                 "complex": [
-                    "Provide a detailed analysis of {concept} including its benefits and limitations."
+                    "Provide a detailed analysis of {concept} including its benefits and limitations.",
+                    "Summarize the challenges and opportunities of {concept}.",
+                    "Explain {concept} in the context of its field."
+                ]
+            },
+            "comparative": {
+                "medium": [
+                    "Compare and contrast {concept} and {concept2}.",
+                    "What are the similarities and differences between {concept} and {concept2}?",
+                    "How do {concept} and {concept2} differ in application?"
+                ],
+                "complex": [
+                    "Analyze the relationship between {concept} and {concept2}.",
+                    "How does {concept} impact {concept2}?",
+                    "Evaluate the trade-offs between {concept} and {concept2}."
                 ]
             }
         }
-        # Add comparative templates for cross-chunk queries
-        self.query_templates["comparative"] = {
-            "medium": [
-                "Compare and contrast {concept} and {concept2}.",
-                "What are the similarities and differences between {concept} and {concept2}?"
-            ],
-            "complex": [
-                "Analyze the relationship between {concept} and {concept2}.",
-                "How does {concept} impact {concept2}?"
-            ]
-        }
 
     def _fill_template(self, template, concepts):
-        """Safely fill any template with provided concepts and defaults."""
         formatter = string.Formatter()
         fields = [fname for _, fname, _, _ in formatter.parse(template) if fname]
         vals = {}
@@ -120,13 +112,10 @@ class QueryGenerator:
             vals['concept'] = concepts[0]
         if 'concept2' in fields and len(concepts) > 1:
             vals['concept2'] = concepts[1]
-        
-        # Fallback for concepts if not enough are provided
         if 'concept' in fields and 'concept' not in vals:
             vals['concept'] = "a given topic"
         if 'concept2' in fields and 'concept2' not in vals:
             vals['concept2'] = "another topic"
-
         try:
             return template.format(**vals)
         except KeyError as e:
@@ -136,17 +125,14 @@ class QueryGenerator:
             logger.error(f"Template formatting error: {e} with template {template} and vals {vals}")
             return template.replace("{", "").replace("}", "")
 
-    # Make this method asynchronous
     async def extract_concepts_from_chunk(self, chunk_text: str) -> List[str]:
-        """Extract key concepts from a document chunk using the teacher model"""
-        prompt = f"""Extract only the top 1 most important *concepts* from the text below.
+        prompt = f"""Extract up to 3 most important *concepts* from the text below.
 
             Rules:
-            - Return as a single line.
+            - Return as a single line, comma-separated.
             - Never return multiple lines.
-            - Never add any bullet points, numbering etc.
-            - Do not include any numbering, bullet points, or explanations.
-            - Concept should be always less than 4 words.
+            - Never add bullet points, numbering, or explanations.
+            - Each concept should be less than 4 words.
             - Focus on specific technical or domain-relevant terms.
 
             Example:
@@ -155,56 +141,61 @@ class QueryGenerator:
             Deep learning is a subfield of machine learning concerned with algorithms inspired by the structure of the brain. It is used in image recognition, natural language processing, and robotics.
             \"\"\"
             Concepts:
-            deep learning
+            deep learning, image recognition, natural language processing
 
             Now extract from this:
             Text:
             \"\"\"
             {chunk_text}
             \"\"\"
-
             Concepts:"""
-
         try:
-            # Await the asynchronous generate_response method
             response, _ = await self.teacher_model.generate_response(prompt, max_tokens=1000)
-            
-            # Split response into lines and remove junk intro lines
             lines = response.splitlines()
             filtered_lines = [
                 line for line in lines
                 if not any(phrase in line.lower() for phrase in ["here are", "top", "concepts", "the text", "most important", "i am an ai"])
             ]
-
-            # Join and clean again
             cleaned_response = ' '.join(filtered_lines)
-            cleaned_response = re.sub(r"[\n\r\t]+", ",", cleaned_response)   # convert newlines to commas
-            cleaned_response = re.sub(r"\d+\.\s*|\*\s*|\-\s*", "", cleaned_response)   # remove bullets
-            
-            STOPWORDS = {'the', 'and', 'or', 'is', 'a', 'an', 'of', 'in', 'to', 'for', 'with'} # Expanded stopwords
+            cleaned_response = re.sub(r"[\n\r\t]+", ",", cleaned_response)
+            cleaned_response = re.sub(r"\d+\.\s*|\*\s*|\-\s*", "", cleaned_response)
+            STOPWORDS = {'the', 'and', 'or', 'is', 'a', 'an', 'of', 'in', 'to', 'for', 'with', 'on', 'at', 'by'}
             concepts = [c.strip().lower() for c in cleaned_response.split(',') if c.strip()]
-            # Filter concepts based on stopwords and length
             concepts = [c for c in concepts if c not in STOPWORDS and len(c.split()) <= 4 and len(c) > 2]
-            return concepts[:3] # Return top 3 concepts
+            return concepts[:3]
         except Exception as e:
             logger.error(f"Error extracting concepts: {e}")
             return []
 
-    # Make this method asynchronous
+    async def paraphrase_query(self, query: str) -> str:
+        """Paraphrase a query using the teacher model"""
+        prompt = f"""Paraphrase the following query without changing its meaning:
+
+            Original Query: {query}
+
+            Paraphrased Query:"""
+        try:
+            response, _ = await self.teacher_model.generate_response(prompt, max_tokens=200, temperature=0.8)
+            paraphrased = response.strip()
+            if any(bad_phrase in paraphrased.lower() for bad_phrase in ["here are", "i am an ai"]):
+                return query
+            return paraphrased
+        except Exception as e:
+            logger.error(f"Error paraphrasing query: {e}")
+            return query
+
     async def generate_synthetic_queries(self, document_chunks: List[Dict], 
-                                   queries_per_chunk: int = 5) -> List[Dict]:
-        """Generate synthetic queries from document chunks"""
+                                        queries_per_chunk: int = 10) -> List[Dict]:
         all_queries = []
         for chunk in tqdm(document_chunks, desc="Generating synthetic queries"):
             chunk_text = chunk['content']
             chunk_id = chunk['id']
-            # Await the asynchronous concept extraction
             concepts = await self.extract_concepts_from_chunk(chunk_text)
             if not concepts:
                 continue
             chunk_queries = []
             for _ in range(queries_per_chunk):
-                query_type = random.choice([k for k in self.query_templates.keys() if k != "comparative"]) # Exclude comparative for single chunk
+                query_type = random.choice([k for k in self.query_templates.keys() if k != "comparative"])
                 difficulty = random.choice(list(self.query_templates[query_type].keys()))
                 templates = self.query_templates[query_type][difficulty]
                 template = random.choice(templates)
@@ -212,118 +203,110 @@ class QueryGenerator:
                 if any(bad_phrase in query.lower() for bad_phrase in ["here are", "top 3", "top 5", "the text", "concepts from the text", "i am an ai"]):
                     logger.warning(f"Skipping malformed query: {query}")
                     continue
-
+                # Add original query
                 chunk_queries.append({
                     'query': query,
                     'source_chunk_id': chunk_id,
                     'query_type': query_type,
                     'difficulty_level': difficulty,
-                    'concepts': concepts
+                    'concepts': concepts,
+                    'is_paraphrased': False
                 })
+                # Add paraphrased query
+                paraphrased_query = await self.paraphrase_query(query)
+                if paraphrased_query != query:
+                    chunk_queries.append({
+                        'query': paraphrased_query,
+                        'source_chunk_id': chunk_id,
+                        'query_type': query_type,
+                        'difficulty_level': difficulty,
+                        'concepts': concepts,
+                        'is_paraphrased': True
+                    })
             all_queries.extend(chunk_queries)
         return all_queries
 
-    # Make this method asynchronous
     async def generate_cross_chunk_queries(self, document_chunks: List[Dict], 
-                                     num_queries: int = 100) -> List[Dict]:
-        """Generate queries that require information from multiple chunks"""
+                                          num_queries: int = 100) -> List[Dict]:
         cross_chunk_queries = []
-        chunk_texts = [chunk['content'] for chunk in document_chunks]
-        
-        # Ensure we have enough chunks for cross-chunk queries
         if len(document_chunks) < 2:
             logger.warning("Not enough chunks for cross-chunk query generation.")
             return []
-
         for _ in range(num_queries):
-            selected_indices = random.sample(range(len(document_chunks)), 
-                                             min(random.randint(2, 3), len(document_chunks))) # Select 2 or 3 chunks
+            selected_indices = random.sample(range(len(document_chunks)), min(random.randint(2, 3), len(document_chunks)))
             selected_chunks = [document_chunks[i] for i in selected_indices]
             all_concepts = []
             for chunk in selected_chunks:
-                # Await the asynchronous concept extraction
                 concepts = await self.extract_concepts_from_chunk(chunk['content'])
                 all_concepts.extend(concepts)
-            
-            # Ensure we have at least two distinct concepts for comparative queries
             unique_concepts = list(set(all_concepts))
             if len(unique_concepts) < 2:
                 continue
-
             query_types = ['comparative', 'analytical']
             query_type = random.choice(query_types)
             difficulty = random.choice(['medium', 'complex'])
             templates = self.query_templates[query_type][difficulty]
             template = random.choice(templates)
-            
-            # For comparative, ensure we pick two different concepts if possible
             if query_type == 'comparative' and len(unique_concepts) >= 2:
                 concept1, concept2 = random.sample(unique_concepts, 2)
                 concepts_for_template = [concept1, concept2]
             else:
-                concepts_for_template = unique_concepts # Use all unique concepts, _fill_template will pick
-            
+                concepts_for_template = unique_concepts
             query = self._fill_template(template, concepts_for_template)
-            
             if any(bad_phrase in query.lower() for bad_phrase in ["here are", "top 3", "top 5", "the text", "concepts from the text", "i am an ai"]):
                 logger.warning(f"Skipping malformed query: {query}")
                 continue
-
-            cross_chunk_queries.append({
+            chunk_queries = [{
                 'query': query,
                 'source_chunk_ids': [chunk['id'] for chunk in selected_chunks],
                 'query_type': query_type,
                 'difficulty_level': difficulty,
-                'concepts': all_concepts
-            })
+                'concepts': all_concepts,
+                'is_paraphrased': False
+            }]
+            paraphrased_query = await self.paraphrase_query(query)
+            if paraphrased_query != query:
+                chunk_queries.append({
+                    'query': paraphrased_query,
+                    'source_chunk_ids': [chunk['id'] for chunk in selected_chunks],
+                    'query_type': query_type,
+                    'difficulty_level': difficulty,
+                    'concepts': all_concepts,
+                    'is_paraphrased': True
+                })
+            cross_chunk_queries.extend(chunk_queries)
         return cross_chunk_queries
 
     def remove_duplicate_queries(self, queries: List[Dict], similarity_threshold: float = 0.95) -> List[Dict]:
-        """
-        Removes duplicate or very similar queries from a list of query dictionaries.
-        Keeps the first encountered query in case of similarity.
-        """
         if not queries:
             return []
-        
         query_texts = [q['query'] for q in queries]
-        query_embeddings = self.embedding_model.encode(query_texts, show_progress_bar=False) # No progress bar for this internal step
-
-        # Use a list to maintain order, a set to track indices to remove
+        query_embeddings = self.embedding_model.encode(query_texts, show_progress_bar=False)
         to_remove_indices = set()
-        
-        # Iterate over unique pairs (i, j)
         for i in tqdm(range(len(queries)), desc="Deduplicating queries"):
             if i in to_remove_indices:
                 continue
             for j in range(i + 1, len(queries)):
                 if j in to_remove_indices:
                     continue
-                
-                # Calculate cosine similarity between query i and query j
                 similarity = cosine_similarity(
                     query_embeddings[i].reshape(1, -1), 
                     query_embeddings[j].reshape(1, -1)
                 )[0][0]
-
                 if similarity > similarity_threshold:
-                    to_remove_indices.add(j) # Mark the second (j) query for removal
-                    # Note: For pre-LLM deduplication, we typically just remove one instance.
-                    # No complex logic needed based on confidence yet.
-
+                    to_remove_indices.add(j)
         filtered_queries = [query for idx, query in enumerate(queries) if idx not in to_remove_indices]
         logger.info(f"Removed {len(queries) - len(filtered_queries)} duplicate queries (pre-LLM).")
         return filtered_queries
 
 class TeacherResponseCollector:
-    """Collect high-quality responses from the teacher model"""
     def __init__(self, teacher_model: BaseTeacherModel, vector_store: VectorStore, retrieval_k=3):
         self.teacher_model = teacher_model
         self.vector_store = vector_store
         self.retrieval_k = retrieval_k
+        self.embedding_model = SentenceTransformer('all-mpnet-base-v2')
 
     def retrieve_context(self, query: str) -> Tuple[str, List[str]]:
-        """Retrieve relevant context for a query"""
         try:
             relevant_docs = self.vector_store.search(query, k=self.retrieval_k)
             context = "\n\n".join([doc['content'] for doc in relevant_docs])
@@ -333,96 +316,75 @@ class TeacherResponseCollector:
             logger.error(f"Error retrieving context: {e}")
             return "", []
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def generate_teacher_response_async(self, query: str, context: str) -> Tuple[str, float]:
-        """Generate response from teacher model with confidence estimation (async version)"""
-        prompt = f"""
-            You are an expert AI assistant tasked with answering questions STRICTLY based on the provided "Context Information".
-            Your primary directive is to use ONLY the facts and details present in the given context.
-            DO NOT use any external knowledge or pre-trained information.
-            If the answer to the question cannot be found or fully derived from the "Context Information", you MUST state: "I don't know based on the provided context."
-
-            Context Information:
+        prompt = f"""You are an expert AI assistant tasked with generating a high-quality, concise, and original answer to the following question.
+            Your answer MUST be derived SOLELY from the provided context. Synthesize and rephrase the information; **do NOT copy sentences directly from the context.**
+            If the context does not contain the answer, state "I cannot answer this question based on the provided information."
+            
+            Context:
             {context}
-
+            
             Question: {query}
-
-            Instructions:
-            - Base your entire answer EXCLUSIVELY on the "Context Information" provided above.
-            - Be accurate, clear, and comprehensive, but only within the bounds of the context.
-            - If you cannot answer the question using ONLY the provided context, state: "I don't know based on the provided context." Do not attempt to guess or infer.
-
-            Answer:
-            """
+            
+            Answer:"""
         try:
             response_text, _ = await self.teacher_model.generate_response(prompt, max_tokens=512, temperature=0.1)
-            confidence = self.estimate_confidence(response_text, context)
+            confidence = self.estimate_confidence(response_text, context, query)
             return response_text.strip(), confidence
         except Exception as e:
             logger.error(f"Error generating teacher response: {e}")
             return "", 0.0
 
-    def estimate_confidence(self, response: str, context: str) -> float:
-        """Estimate confidence of the teacher response"""
+    def estimate_confidence(self, response: str, context: str, query: str) -> float:
         confidence = 0.5
-        # If the model explicitly states it doesn't know, assign low confidence
-        if "i don't know based on the provided context" in response.lower():
+        if "i cannot answer this question based on the provided information" in response.lower():
             return 0.1
-
-        # Adjust confidence based on response length
         if len(response) > 100:
             confidence += 0.2
         if len(response) > 200:
             confidence += 0.1
-        
-        # Calculate keyword overlap (simple measure)
         context_words = set(re.findall(r'\b\w+\b', context.lower()))
         response_words = set(re.findall(r'\b\w+\b', response.lower()))
-        
         if response_words:
             overlap_ratio = len(context_words.intersection(response_words)) / len(response_words)
             confidence += overlap_ratio * 0.3
-        
-        # Penalize if response indicates uncertainty, even if not the explicit "I don't know" phrase
         uncertain_phrases = ['i am not sure', 'unclear', 'insufficient information', 
-                             'cannot determine', 'not enough context', 'it is not clear from the context']
+                            'cannot determine', 'not enough context', 'it is not clear from the context']
         for phrase in uncertain_phrases:
             if phrase in response.lower():
                 confidence -= 0.3
-                break # Only penalize once for uncertainty phrases
-
-        return max(0.0, min(1.0, confidence)) # Ensure confidence is between 0 and 1
+                break
+        embeddings = self.embedding_model.encode([query, response])
+        query_response_similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+        confidence += query_response_similarity * 0.2
+        return max(0.0, min(1.0, confidence))
 
     async def collect_responses_batch_async(self, queries: List[Dict], batch_size: int = 10) -> List[TrainingExample]:
-        """Collect teacher responses for a batch of queries asynchronously"""
         training_examples = []
-        # Create a list of tasks for asynchronous processing
         tasks = []
         for query_data in queries:
             tasks.append(self._process_single_query_async(query_data))
-        
-        # Process tasks in batches
         for i in tqdm(range(0, len(tasks), batch_size), desc="Collecting teacher responses"):
             batch_tasks = tasks[i:i+batch_size]
-            results = await asyncio.gather(*batch_tasks)
-            for example in results:
-                if example: # Only append if the example was successfully created
-                    training_examples.append(example)
+            results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Error in batch processing: {result}")
+                    continue
+                if result:
+                    training_examples.append(result)
         return training_examples
 
     async def _process_single_query_async(self, query_data: Dict) -> Optional[TrainingExample]:
-        """Helper to process a single query for async batching"""
         query = query_data['query']
         context, retrieved_docs = self.retrieve_context(query)
-        
         if not context:
             return None
-        
         teacher_response, confidence = await self.generate_teacher_response_async(query, context)
-        
-        # Consider a slightly lower initial confidence threshold here, and filter more strictly later
-        if not teacher_response or confidence < 0.2: # Lower this to capture more, then filter
+        await asyncio.sleep(60)
+        if not teacher_response or confidence < 0.2:
             return None
-        
         training_example = TrainingExample(
             query=query,
             context=context,
@@ -433,98 +395,92 @@ class TeacherResponseCollector:
             difficulty_level=query_data.get('difficulty_level', 'medium'),
             metadata={
                 'source_chunk_ids': query_data.get('source_chunk_ids', []),
-                'concepts': query_data.get('concepts', [])
+                'concepts': query_data.get('concepts', []),
+                'is_paraphrased': query_data.get('is_paraphrased', False)
             }
         )
         return training_example
 
-
 class DataQualityController:
-    """Control and filter the quality of training data"""
-    def __init__(self, embedding_model_name="all-MiniLM-L6-v2"):
+    def __init__(self, embedding_model_name="all-mpnet-base-v2"):
         self.embedding_model = SentenceTransformer(embedding_model_name)
 
-    def filter_by_confidence(self, examples: List[TrainingExample], min_confidence: float = 0.5) -> List[TrainingExample]:
-        """Filter examples by teacher confidence threshold"""
+    def filter_by_confidence(self, examples: List[TrainingExample], min_confidence: float = 0.9) -> List[TrainingExample]:
         initial_count = len(examples)
         filtered = [ex for ex in examples if ex.teacher_confidence >= min_confidence]
         logger.info(f"Filtered {initial_count - len(filtered)} examples by confidence (min: {min_confidence}).")
         return filtered
 
+    def filter_by_relevance(self, examples: List[TrainingExample], similarity_threshold: float = 0.6) -> List[TrainingExample]:
+        initial_count = len(examples)
+        filtered = []
+        query_texts = [ex.query for ex in examples]
+        response_texts = [ex.teacher_response for ex in examples]
+        embeddings = self.embedding_model.encode(query_texts + response_texts, show_progress_bar=False)
+        query_embeddings = embeddings[:len(examples)]
+        response_embeddings = embeddings[len(examples):]
+        for i, ex in enumerate(examples):
+            similarity = cosine_similarity(
+                query_embeddings[i].reshape(1, -1),
+                response_embeddings[i].reshape(1, -1)
+            )[0][0]
+            if similarity >= similarity_threshold:
+                filtered.append(ex)
+        logger.info(f"Filtered {initial_count - len(filtered)} examples by relevance (min similarity: {similarity_threshold}).")
+        return filtered
+
     def remove_duplicates(self, examples: List[TrainingExample], similarity_threshold: float = 0.95) -> List[TrainingExample]:
-        """Remove duplicate or very similar examples (post-LLM response evaluation)"""
         if not examples:
             return examples
-        
         logger.info(f"Starting post-LLM deduplication of {len(examples)} examples...")
-        
         queries = [ex.query for ex in examples] 
-        query_embeddings = self.embedding_model.encode(queries, show_progress_bar=False) 
-        
+        query_embeddings = self.embedding_model.encode(queries, show_progress_bar=False)
         to_remove = set()
-        
-        # Use a progress bar for this potentially long operation
         for i in tqdm(range(len(examples)), desc="Deduplicating post-LLM responses"):
             if i in to_remove:
                 continue
             for j in range(i + 1, len(examples)):
                 if j in to_remove:
                     continue
-                
                 similarity = cosine_similarity(
                     query_embeddings[i].reshape(1, -1), 
                     query_embeddings[j].reshape(1, -1)
                 )[0][0]
-
                 if similarity > similarity_threshold:
-                    # Keep the one with higher confidence if queries are similar
                     if examples[i].teacher_confidence >= examples[j].teacher_confidence:
                         to_remove.add(j)
                     else:
                         to_remove.add(i)
-                        break 
-        
+                        break
         filtered_examples = [ex for i, ex in enumerate(examples) if i not in to_remove]
         logger.info(f"Removed {len(examples) - len(filtered_examples)} duplicate examples (post-LLM).")
         return filtered_examples
 
     def balance_dataset(self, examples: List[TrainingExample]) -> List[TrainingExample]:
-        """Balance the dataset across query types and difficulty levels"""
         if not examples:
             logger.warning("No training examples to balance. Returning empty list.")
             return []
-        
         groups = {}
         for ex in examples:
             key = (ex.query_type, ex.difficulty_level)
             if key not in groups:
                 groups[key] = []
             groups[key].append(ex)
-        
-        if not groups: # Should not happen if examples is not empty, but safety check
+        if not groups:
             return []
-
-        # Determine target size: aiming for a balanced number per group, but not too small
-        min_group_size = min(len(group) for group in groups.values())
-        # Set a reasonable target, e.g., median group size, or a fixed minimum like 20.
         group_sizes = [len(group) for group in groups.values()]
-        target_size = max(20, int(np.median(group_sizes))) 
-
-
+        target_size = max(30, int(np.median(group_sizes)))
         balanced_examples = []
         for key, group in groups.items():
             if len(group) <= target_size:
                 balanced_examples.extend(group)
             else:
-                # Sort by confidence and take the top `target_size`
                 sorted_group = sorted(group, key=lambda x: x.teacher_confidence, reverse=True)
                 balanced_examples.extend(sorted_group[:target_size])
-        
         logger.info(f"Balanced dataset: {len(balanced_examples)} examples across {len(groups)} groups with target size {target_size}.")
         return balanced_examples
 
 class TrainingDatasetBuilder:
-    """Main class to orchestrate training data generation"""
     def __init__(self, teacher_model: BaseTeacherModel, vector_store: VectorStore, output_dir: str = "training_data"):
         self.teacher_model = teacher_model
         self.vector_store = vector_store
@@ -534,59 +490,43 @@ class TrainingDatasetBuilder:
         self.response_collector = TeacherResponseCollector(teacher_model, vector_store)
         self.quality_controller = DataQualityController()
 
-    # Make this method asynchronous
     async def build_training_dataset(self, document_chunks: List[Dict], 
-                                     queries_per_chunk: int = 3,
-                                     cross_chunk_queries_count: int = 50, # New parameter for cross-chunk queries
-                                     min_confidence: float = 0.4) -> List[TrainingExample]:
+                                    queries_per_chunk: int = 10,
+                                    cross_chunk_queries_count: int = 100,
+                                    min_confidence: float = 0.9) -> List[TrainingExample]:
         logger.info("Starting training dataset generation...")
-
-        # 1. Generate synthetic queries
         logger.info("Generating synthetic queries (initial pool)...")
-        # Await the asynchronous method
         synthetic_queries = await self.query_generator.generate_synthetic_queries(
             document_chunks, queries_per_chunk
         )
         print("\n=== Generated Synthetic Queries (Raw, Sample) ===")
-        for i, q in enumerate(synthetic_queries[:5]): # Print a sample
-            print(f"- {q['query']}")
+        for i, q in enumerate(synthetic_queries[:5]):
+            print(f"- {q['query']} (Paraphrased: {q['is_paraphrased']})")
         if len(synthetic_queries) > 5:
             print(f"... and {len(synthetic_queries) - 5} more.")
         print("=== End of Raw Query Sample ===\n")
-
-        # Generate cross-chunk queries
         logger.info(f"Generating {cross_chunk_queries_count} cross-chunk queries...")
-        # Await the asynchronous method
         cross_chunk_queries = await self.query_generator.generate_cross_chunk_queries(
             document_chunks, num_queries=cross_chunk_queries_count
         )
         logger.info(f"Generated {len(cross_chunk_queries)} cross-chunk queries.")
-        
         all_queries_raw = synthetic_queries + cross_chunk_queries
         logger.info(f"Generated {len(all_queries_raw)} total raw queries (synthetic + cross-chunk).")
-
-        # --- NEW STEP: Deduplicate queries BEFORE sending to teacher ---
-        logger.info("Deduplicating queries before sending to teacher (to save LLM calls)...")
+        logger.info("Deduplicating queries before sending to teacher...")
         unique_queries = self.query_generator.remove_duplicate_queries(all_queries_raw)
         logger.info(f"After pre-LLM deduplication: {len(unique_queries)} unique queries.")
-
         logger.info("Collecting teacher responses for unique queries (this may take time)...")
-        # This method is already async, so no change needed here beyond the above awaits.
         training_examples = await self.response_collector.collect_responses_batch_async(unique_queries)
         logger.info(f"Collected {len(training_examples)} training examples.")
-
         logger.info("Applying quality control...")
-        training_examples = self.quality_controller.filter_by_confidence(
-            training_examples, min_confidence
-        )
+        training_examples = self.quality_controller.filter_by_confidence(training_examples, min_confidence)
         logger.info(f"After confidence filtering: {len(training_examples)} examples.")
-        
+        training_examples = self.quality_controller.filter_by_relevance(training_examples)
+        logger.info(f"After relevance filtering: {len(training_examples)} examples.")
         training_examples = self.quality_controller.remove_duplicates(training_examples)
         logger.info(f"After post-LLM deduplication: {len(training_examples)} examples.")
-        
         training_examples = self.quality_controller.balance_dataset(training_examples)
         logger.info(f"Final balanced dataset: {len(training_examples)} examples.")
-        
         return training_examples
 
     def save_dataset(self, training_examples: List[TrainingExample], 
@@ -628,17 +568,16 @@ class TrainingDatasetBuilder:
             'avg_confidence': float(np.mean([ex.teacher_confidence for ex in training_examples])) if training_examples else 0.0,
             'query_type_distribution': {},
             'difficulty_distribution': {},
+            'paraphrase_ratio': sum(1 for ex in training_examples if ex.metadata.get('is_paraphrased', False)) / len(training_examples) if training_examples else 0.0,
             'confidence_distribution': {
                 'high_confidence (>0.8)': sum(1 for ex in training_examples if ex.teacher_confidence > 0.8),
-                'medium_confidence (0.5-0.8)': sum(1 for ex in training_examples 
-                                                     if 0.5 <= ex.teacher_confidence <= 0.8),
+                'medium_confidence (0.5-0.8)': sum(1 for ex in training_examples if 0.5 <= ex.teacher_confidence <= 0.8),
                 'low_confidence (<0.5)': sum(1 for ex in training_examples if ex.teacher_confidence < 0.5)
             }
         }
         for ex in training_examples:
             query_type = ex.query_type
             stats['query_type_distribution'][query_type] = stats['query_type_distribution'].get(query_type, 0) + 1
-        for ex in training_examples:
             difficulty = ex.difficulty_level
             stats['difficulty_distribution'][difficulty] = stats['difficulty_distribution'].get(difficulty, 0) + 1
         stats_file = self.output_dir / "dataset_statistics.json"
@@ -648,17 +587,16 @@ class TrainingDatasetBuilder:
         print("\n=== Dataset Statistics ===")
         print(f"Total examples: {stats['total_examples']}")
         print(f"Average confidence: {stats['avg_confidence']:.3f}")
+        print(f"Paraphrase ratio: {stats['paraphrase_ratio']:.3f}")
         print(f"Query types: {stats['query_type_distribution']}")
         print(f"Difficulty levels: {stats['difficulty_distribution']}")
         print(f"Confidence distribution: {stats['confidence_distribution']}")
 
-async def main(): # This is already async, which is good
-    """Main entry for real training data generation pipeline"""
-
-    # Load document chunks from Phase 1
+async def main():
+    env_path = Path(__file__).parent / '.env'
+    load_dotenv(dotenv_path=env_path)
     print("Loading document chunks from ChromaDB vector store (Phase 1)...")
     vector_store = VectorStore(collection_name="rag_demo", persist_directory="./data/chroma_db")
-    
     collection_stats = vector_store.get_collection_stats()
     total_chunks = collection_stats['total_chunks']
     if total_chunks == 0:
@@ -673,35 +611,26 @@ async def main(): # This is already async, which is good
             'id': chunks_raw['ids'][i],
             'content': chunks_raw['documents'][i]
         })
-
-    # Initialize teacher model (Groq Llama3 from Phase 2)
-    print("\nInitializing teacher model (Groq Llama3 from Phase 2)...")
+    print("\nInitializing teacher model (Groq mixtral-8x7b-32768)...")
     try:
         teacher_model = TeacherModelFactory.create_model(
             'groq',
-            model_name='llama3-8b-8192', # Or your preferred Groq model
+            model_name='llama3-70b-8192',
             groq_api_key=os.getenv("GROQ_API_KEY") 
         )
-        print("   ✓ Groq Llama3 model initialized successfully.")
+        print("   ✓ Groq mixtral-8x7b-32768 model initialized successfully.")
     except Exception as e:
         print(f"   ✗ Groq model initialization failed: {e}")
-        print("   Please ensure GROQ_API_KEY environment variable is set correctly and the model name is valid.")
         return
-
-    # Build training dataset
     dataset_builder = TrainingDatasetBuilder(teacher_model, vector_store)
-    # Await the async method call
-    training_examples = await dataset_builder.build_training_dataset( 
+    training_examples = await dataset_builder.build_training_dataset(
         document_chunks,
-        queries_per_chunk=4,
-        cross_chunk_queries_count=20, # You can adjust this
-        min_confidence=0.4
+        queries_per_chunk=5,
+        cross_chunk_queries_count=20,
+        min_confidence=0.8
     )
-
-    # Save dataset
     dataset_builder.save_dataset(training_examples)
-
     print(f"\nTraining dataset generation complete! Generated {len(training_examples)} examples.")
 
 if __name__ == "__main__":
-    asyncio.run(main()) # Ensure main is run as an async function
+    asyncio.run(main())
